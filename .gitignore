@@ -1,0 +1,6 @@
+runs/
+videos/
+x/
+models/
+
+*.pt
