@@ -4,3 +4,6 @@ x/
 models/
 d
 *.pt
+output_videos/
+inputs/
+outputs/
