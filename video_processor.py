@@ -51,6 +51,12 @@ class KSoccer:
         self.frames_equipo_2 = 0
         self.total_frames = 0
 
+        # Add team color tracking
+        self.team1_color = None
+        self.team2_color = None
+        self.color_confidence = 0
+        self.min_players_for_team = 3  # Minimum players needed to establish team colors
+
         
     def procesar(self, num_frames=None, frame_skip=0):
         frames_procesados = 0
@@ -103,64 +109,47 @@ class KSoccer:
 
 
     def process_frame(self, frame):
-        # Factor de escala
-
         original_height, original_width = frame.shape[:2]
         frame = cv2.resize(frame, (int(original_width * self.scale_factor), int(original_height * self.scale_factor)))
 
-        # Detectar solo personas con batch processing
+        # Process person detections
         results = self.yolo_model(frame, classes=[0], conf=0.25)
-       
-
-        ball_results = self.model_pelota(frame, classes=[32], conf = 0.1)
-
         
-
+        # Process ball detections
+        ball_results = self.model_pelota(frame, classes=[32], conf=0.1)
         frame_with_detections = frame.copy()
-        # initialize any numpy array
-        ball_bbox = np.zeros(1)
+        
+        # Get ball bbox if detected
+        ball_bbox = np.array([0, 0, 0, 0])
+        if len(ball_results[0].boxes) > 0:
+            ball_box = ball_results[0].boxes[0]
+            if len(ball_box.xyxy) > 0:
+                ball_bbox = ball_box.xyxy[0].cpu().numpy()
 
-        for ball_result in ball_results:
-            ball_detections = ball_result.boxes
-
-            for detection in ball_detections:
-                if len(detection.xyxy) >= 1:
-                    ball_bbox = detection.xyxy[0].cpu().numpy().astype(int)
-                    ball_center_x = (ball_bbox[0] + ball_bbox[2]) / 2
-                    ball_center_y = (ball_bbox[1] + ball_bbox[3]) / 2
-                    cv2.circle(frame, (int(ball_center_x), int(ball_center_y)), radius = 10, color = (0,0,255), thickness = -1)
-
+        player_detections = []
+        
+        # Process all detected players
         for result in results:
-            # Procesar resultados
             detections = result.boxes
             processed_frame = self.preprocess_frame(frame)
-            player_detections = []
             
-
-            # Process each detection
             for detection in detections:
                 if len(detection.xyxy) >= 1:
                     bbox = detection.xyxy[0].cpu().numpy().astype(int)
-
                     player_info = self.process_player(processed_frame, ball_bbox, bbox)
-
                     if player_info:
                         player_detections.append(player_info)
-            
-            # Sort detections by y-coordinate for consistent processing
-            player_detections.sort(key=lambda x: x['bbox'][1])
-            
-            # Process team assignments and ball detection
-            frame_with_detections = self.draw_results(frame, player_detections)
-            
-            # Add debug information
-            if self.depurar:
-                cv2.putText(frame_with_detections, 
-                            f"Players detected: {len(player_detections)}", 
-                            (10, frame.shape[0] - 20),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+
+        # Only process team assignments if we have players
+        if player_detections:
+            self.assign_teams(player_detections)
+            # Update possession stats before drawing
+            self.update_possession(player_detections)
+            frame_with_detections = self.draw_results(frame_with_detections, player_detections)
+
+        # Draw possession stats
+        frame_with_detections = self.draw_possession_stats(frame_with_detections)
         
-        # Mostrar el frame con las detecciones
         cv2.imshow('Detecciones', frame_with_detections)
         return frame_with_detections
         
@@ -168,152 +157,207 @@ class KSoccer:
 
     def process_player(self, frame, ball_bbox, player_bbox):
         """
-        Extract player information including team colors and possible ball possession
+        Modified to return ball position when possession is detected
         """
-        x1, y1, x2, y2 = player_bbox
-        
-        # Calculate expanded region for better ball detection
-        mid_coords = np.array([(x1 + x2) // 2, (y1 + y2) // 2])
-        half_dims = np.array([(x2 - x1) // 2, (y2 - y1) // 2])
-        
-        # Calculate expanded coordinates with scale factor
-        scale_factor = 3
-        expanded_half_dims = (half_dims * scale_factor).astype(int)
-        expanded_coords = np.array([
-            max(0, mid_coords[0] - expanded_half_dims[0]),
-            max(0, mid_coords[1] - expanded_half_dims[1]),
-            min(frame.shape[1], mid_coords[0] + expanded_half_dims[0]),
-            min(frame.shape[0], mid_coords[1] + expanded_half_dims[1])
-        ])
-        
-        # Extract jersey region (upper body)
-        body_height = y2 - y1
-        jersey_y1 = y1 + int(body_height * 0.2)
-        jersey_y2 = y1 + int(body_height * 0.5)
-        jersey_region = frame[jersey_y1:jersey_y2, x1:x2]
-        
-        if jersey_region.size == 0:
-            return None
+        try:
+            x1, y1, x2, y2 = player_bbox
             
-        # Get dominant colors using k-means
-        jersey_color = self.get_dominant_color(jersey_region)
-        
-        # Check for ball possession using expanded region
-        has_ball = self.ball_possession(ball_bbox, expanded_coords)
-        
-        return {
-            'bbox': player_bbox,
-            'jersey_color': jersey_color,
-            'has_ball': has_ball,
-            'expanded_coords': expanded_coords  # Add this for visualization if needed
-        }
+            # Basic validation
+            if x2 <= x1 or y2 <= y1:
+                if self.depurar:
+                    print("Invalid bbox dimensions")
+                return None
+                
+            # Extract jersey region (upper body)
+            body_height = y2 - y1
+            jersey_y1 = int(y1 + body_height * 0.15)  # Start slightly higher
+            jersey_y2 = int(y1 + body_height * 0.45)  # End before middle
+            jersey_x1 = int(x1 + (x2 - x1) * 0.1)  # Trim sides to avoid arms
+            jersey_x2 = int(x2 - (x2 - x1) * 0.1)
+            
+            # Ensure coordinates are within frame bounds
+            jersey_y1 = max(0, jersey_y1)
+            jersey_y2 = min(frame.shape[0], jersey_y2)
+            jersey_x1 = max(0, jersey_x1)
+            jersey_x2 = min(frame.shape[1], jersey_x2)
+            
+            if jersey_y2 <= jersey_y1 or jersey_x2 <= jersey_x1:
+                if self.depurar:
+                    print("Invalid jersey region")
+                return None
+            
+            jersey_region = frame[jersey_y1:jersey_y2, jersey_x1:jersey_x2]
+            
+            if jersey_region.size == 0:
+                if self.depurar:
+                    print("Empty jersey region")
+                return None
+                
+            # Get dominant colors
+            jersey_color = self.get_dominant_color(jersey_region)
+            if jersey_color is None:
+                if self.depurar:
+                    print("No dominant color found")
+                return None
+
+            # Calculate expanded region for ball detection
+            mid_coords = np.array([(x1 + x2) // 2, (y1 + y2) // 2])
+            half_dims = np.array([(x2 - x1) // 2, (y2 - y1) // 2])
+            expanded_half_dims = (half_dims * 3).astype(int)
+            
+            expanded_coords = np.array([
+                max(0, mid_coords[0] - expanded_half_dims[0]),
+                max(0, mid_coords[1] - expanded_half_dims[1]),
+                min(frame.shape[1], mid_coords[0] + expanded_half_dims[0]),
+                min(frame.shape[0], mid_coords[1] + expanded_half_dims[1])
+            ])
+            
+            has_ball, ball_pos = self.ball_possession(ball_bbox, expanded_coords)
+            
+            if self.depurar:
+                # Draw jersey region for debugging
+                debug_frame = frame.copy()
+                cv2.rectangle(debug_frame, (jersey_x1, jersey_y1), (jersey_x2, jersey_y2), (0, 255, 0), 2)
+                cv2.imshow('Jersey Region', debug_frame)
+            
+            return {
+                'bbox': player_bbox,
+                'jersey_color': jersey_color,
+                'has_ball': has_ball,
+                'ball_position': ball_pos,
+                'player_center': (int((x1 + x2) // 2), int((y1 + y2) // 2))  # Add player center
+            }
+            
+        except Exception as e:
+            if self.depurar:
+                print(f"Error in process_player: {str(e)}")
+            return None
 
     def ball_possession(self, ball_bbox, expanded_coords):
         """
-        Enhanced ball detection using expanded region around player
+        Enhanced ball detection using distance calculation
         """
         if ball_bbox.any():
             ball_center_x = (ball_bbox[0] + ball_bbox[2]) / 2
             ball_center_y = (ball_bbox[1] + ball_bbox[3]) / 2
             
-            # Check if ball center is within expanded region
+            # Calculate relative position in expanded region
             if (expanded_coords[0] <= ball_center_x <= expanded_coords[2] and
                 expanded_coords[1] <= ball_center_y <= expanded_coords[3]):
                 
-                # Calculate relative position in expanded region
-                rel_x = (ball_center_x - expanded_coords[0]) / (expanded_coords[2] - expanded_coords[0])
-                rel_y = (ball_center_y - expanded_coords[1]) / (expanded_coords[3] - expanded_coords[1])
-                
-                # Give higher weight to balls detected closer to player center
-                center_distance = np.sqrt((rel_x - 0.5)**2 + (rel_y - 0.5)**2)
-                if center_distance < 0.7:  # Adjust this threshold as needed
-                    return True
+                # Store ball position for drawing
+                return True, (int(ball_center_x), int(ball_center_y))
         
-        return False
+        return False, None
 
-    def get_dominant_color(self, image, k=3):
+    def get_dominant_color(self, image):
         """
-        Improved dominant color extraction with better filtering
+        More robust color detection using k-means
         """
         try:
-            # Resize for consistency
-            #image = cv2.resize(image, (50, 50))
-            
+            if image.size == 0 or image is None:
+                return None
+
+            # Resize image for faster processing
+            height, width = image.shape[:2]
+            if height * width > 10000:  # If image is too large
+                scale = np.sqrt(10000 / (height * width))
+                new_size = (int(width * scale), int(height * scale))
+                image = cv2.resize(image, new_size)
+
             # Convert to HSV
             hsv_image = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
-            
-            # Create mask for valid colors (exclude very dark/light/unsaturated)
-            mask = cv2.inRange(hsv_image, 
-                              np.array([0, 50, 50]), 
-                              np.array([180, 255, 255]))
-            
-            # Apply mask
-            valid_pixels = hsv_image[mask > 0]
-            
-            if len(valid_pixels) < 10:  # Not enough valid pixels
-                return None
-                
-            # Reshape for k-means
-            valid_pixels = valid_pixels.reshape(-1, 3)
-            
-            # Apply k-means
-            kmeans = KMeans(n_clusters=k, random_state=42, n_init=10)
-            kmeans.fit(valid_pixels)
-            
-            # Get cluster sizes
-            labels, counts = np.unique(kmeans.labels_, return_counts=True)
-            
-            # Sort clusters by size
-            sorted_indices = np.argsort(-counts)
-            centers = kmeans.cluster_centers_[sorted_indices]
-            
-            # Return the largest cluster center that meets our criteria
-            for center in centers:
-                if 20 < center[2] < 235 and center[1] > 40:  # Value and Saturation thresholds
-                    return center
-                    
-            return None
-        except Exception:
-            return None
 
-    
+            # Create mask for valid colors (exclude very dark/light colors)
+            lower_bound = np.array([0, 30, 30])
+            upper_bound = np.array([180, 255, 255])
+            mask = cv2.inRange(hsv_image, lower_bound, upper_bound)
+
+            # Get valid pixels
+            valid_pixels = hsv_image[mask > 0]
+
+            if len(valid_pixels) < 100:  # Need minimum number of valid pixels
+                return None
+
+            # Reshape for k-means
+            pixels = valid_pixels.reshape(-1, 3)
+
+            # Apply k-means clustering
+            kmeans = KMeans(n_clusters=1, random_state=42, n_init=10)
+            kmeans.fit(pixels)
+            dominant_color = kmeans.cluster_centers_[0]
+
+            # Convert back to BGR for visualization
+            dominant_color_bgr = cv2.cvtColor(np.uint8([[dominant_color]]), cv2.COLOR_HSV2BGR)[0][0]
+
+            if self.depurar:
+                print(f"Dominant color (HSV): {dominant_color}")
+                print(f"Dominant color (BGR): {dominant_color_bgr}")
+
+            return dominant_color
+
+        except Exception as e:
+            if self.depurar:
+                print(f"Error in get_dominant_color: {str(e)}")
+            return None
 
     def assign_teams(self, player_detections):
         """
-        Improved team assignment with initialization
+        Improved team assignment with better clustering
         """
-        if not hasattr(self, 'team_colors_history'):
-            self.team_colors_history = []
-        
-        # Extract valid jersey colors
         jersey_colors = [p['jersey_color'] for p in player_detections if p['jersey_color'] is not None]
         
-        if len(jersey_colors) < 2:
+        if len(jersey_colors) < self.min_players_for_team:
+            if self.team1_color is not None and self.team2_color is not None:
+                self._assign_players_to_teams(player_detections)
             return
         
-        # Convert to numpy array
         colors = np.array(jersey_colors)
         
-        # If we don't have established team colors yet
-        if not self.team_colors_history:
-            # Initial clustering
-            kmeans = KMeans(n_clusters=2, random_state=42)
+        # Perform clustering if needed
+        if self.team1_color is None or self.team2_color is None or self.color_confidence < 5:
+            kmeans = KMeans(n_clusters=2, random_state=42, n_init=10)
             kmeans.fit(colors)
-            self.team_colors_history.append(kmeans.cluster_centers_)
+            
+            cluster_labels = kmeans.labels_
+            cluster_sizes = np.bincount(cluster_labels)
+            
+            if min(cluster_sizes) >= self.min_players_for_team:
+                new_centers = kmeans.cluster_centers_
+                
+                if self.team1_color is None:
+                    self.team1_color = new_centers[0]
+                    self.team2_color = new_centers[1]
+                else:
+                    # Smooth transition with better color matching
+                    alpha = 0.8
+                    dist1 = np.linalg.norm(new_centers[0] - self.team1_color)
+                    dist2 = np.linalg.norm(new_centers[0] - self.team2_color)
+                    
+                    if dist1 < dist2:
+                        self.team1_color = alpha * self.team1_color + (1 - alpha) * new_centers[0]
+                        self.team2_color = alpha * self.team2_color + (1 - alpha) * new_centers[1]
+                    else:
+                        self.team1_color = alpha * self.team1_color + (1 - alpha) * new_centers[1]
+                        self.team2_color = alpha * self.team2_color + (1 - alpha) * new_centers[0]
+                
+                self.color_confidence += 1
         
-        # Use most recent team colors
-        current_colors = self.team_colors_history[-1]
-        
-        # Assign teams to players
+        self._assign_players_to_teams(player_detections)
+
+    def _assign_players_to_teams(self, player_detections):
+        """
+        Assign players to teams using established team colors
+        """
         for player in player_detections:
             if player['jersey_color'] is not None:
-                dist1 = np.linalg.norm(player['jersey_color'] - current_colors[0])
-                dist2 = np.linalg.norm(player['jersey_color'] - current_colors[1])
+                dist1 = np.linalg.norm(player['jersey_color'] - self.team1_color)
+                dist2 = np.linalg.norm(player['jersey_color'] - self.team2_color)
                 player['team'] = 1 if dist1 < dist2 else 2
 
     def update_possession(self, player_detections):
         """
-        Simplified possession calculation
+        Updated possession calculation
         """
         team1_has_ball = False
         team2_has_ball = False
@@ -329,51 +373,66 @@ class KSoccer:
         # Update frame counts
         if team1_has_ball:
             self.frames_equipo_1 += 1
-            self.total_frames += 1
-
         elif team2_has_ball:
             self.frames_equipo_2 += 1
+        
+        # Always increment total frames if we have any detections
+        if player_detections:
             self.total_frames += 1
 
     
     def draw_results(self, frame, player_detections):
         """
-        Enhanced visualization with expanded regions and ball possession
+        Modified drawing function to draw lines instead of boxes for ball possession
         """
-        # Assign teams first
-        self.assign_teams(player_detections)
-        
-        # Update possession
-        self.update_possession(player_detections)
-        
-        # Draw player boxes and team assignments
         for player in player_detections:
             bbox = player['bbox']
             team = player.get('team')
             has_ball = player.get('has_ball', False)
-            expanded_coords = player.get('expanded_coords')
             
-            if team is not None:
-                # Draw player box with team color
-                color = (0, 255, 0) if team == 1 else (255, 0, 0)
-                cv2.rectangle(frame, (bbox[0], bbox[1]), (bbox[2], bbox[3]), color, 2)
+            # Set team colors
+            if team == 1:
+                color = (0, 0, 255)  # Red for team 1
+            elif team == 2:
+                color = (255, 0, 0)  # Blue for team 2
+            else:
+                color = (0, 255, 0)  # Green for unassigned
                 
-                # Draw expanded region if ball possession detected
-                if has_ball and expanded_coords is not None:
-                    cv2.rectangle(frame, 
-                                (expanded_coords[0], expanded_coords[1]),
-                                (expanded_coords[2], expanded_coords[3]),
-                                (0, 255, 255), 1)  # Yellow for possession area
+            # Draw player box
+            cv2.rectangle(frame, 
+                         (bbox[0], bbox[1]), 
+                         (bbox[2], bbox[3]), 
+                         color, 2)
+            
+            # Draw team label
+            label = f"Team {team}" if team else "Unknown"
+            
+            # Draw ball possession line
+            if has_ball and player.get('ball_position') is not None:
+                ball_pos = player['ball_position']
+                player_center = player['player_center']
                 
-                # Draw team number and ball possession indicator
-                label = f"Team {team}"
-                if has_ball:
-                    label += " (Ball)"
-                cv2.putText(frame, label, (bbox[0], bbox[1] - 10),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
-                               
-        # Draw possession statistics
-        self.draw_possession_stats(frame)
+                # Draw line from ball to player
+                cv2.line(frame, 
+                        ball_pos, 
+                        player_center,
+                        (0, 255, 255),  # Yellow line
+                        2)  # Line thickness
+                
+                # Add arrow head
+                self.draw_arrow_head(frame, 
+                                   ball_pos, 
+                                   player_center,
+                                   (0, 255, 255),
+                                   15)  # Arrow size
+                
+                label += " (Ball)"
+            
+            # Draw label
+            cv2.putText(frame, label, 
+                        (bbox[0], bbox[1] - 10),
+                        cv2.FONT_HERSHEY_SIMPLEX, 
+                        0.5, color, 2)
         
         return frame
     
@@ -416,32 +475,39 @@ class KSoccer:
 
     def draw_possession_stats(self, frame):
         """
-        Draw possession statistics on frame
+        Fixed possession stats drawing
         """
+        if self.total_frames == 0:
+            return frame
+            
         # Calculate possession percentages
-        total = self.total_frames if self.total_frames > 0 else 1
-        team1_possession = (self.frames_equipo_1 / total) * 100
-        team2_possession = (self.frames_equipo_2 / total) * 100
+        team1_possession = (self.frames_equipo_1 / max(self.total_frames, 1)) * 100
+        team2_possession = (self.frames_equipo_2 / max(self.total_frames, 1)) * 100
         
-        # Draw background rectangle
-        cv2.rectangle(frame, (10, 10), (300, 100), (0, 0, 0), -1)
+        # Draw background
+        overlay = frame.copy()
+        cv2.rectangle(overlay, (10, 10), (300, 100), (0, 0, 0), -1)
+        cv2.addWeighted(overlay, 0.7, frame, 0.3, 0, frame)
         
-        # Draw title
+        # Draw text
         cv2.putText(frame, "Possession Statistics", 
-                    (20, 30), cv2.FONT_HERSHEY_SIMPLEX, 
+                    (20, 35), cv2.FONT_HERSHEY_SIMPLEX, 
                     0.7, (255, 255, 255), 2)
         
-        # Draw team 1 stats
-        cv2.putText(frame, f"Team 1: {team1_possession:.1f}%", 
+        cv2.putText(frame, f"Team 1 (Red): {team1_possession:.1f}%", 
                     (20, 60), cv2.FONT_HERSHEY_SIMPLEX, 
                     0.6, (255, 255, 255), 2)
         
-        # Draw team 2 stats
-        cv2.putText(frame, f"Team 2: {team2_possession:.1f}%", 
-                    (20, 90), cv2.FONT_HERSHEY_SIMPLEX, 
+        cv2.putText(frame, f"Team 2 (Blue): {team2_possession:.1f}%", 
+                    (20, 85), cv2.FONT_HERSHEY_SIMPLEX, 
                     0.6, (255, 255, 255), 2)
+
+        # Debug print
+        if self.depurar:
+            print(f"Frames - Team1: {self.frames_equipo_1}, Team2: {self.frames_equipo_2}, Total: {self.total_frames}")
+            print(f"Possession - Team1: {team1_possession:.1f}%, Team2: {team2_possession:.1f}%")
         
-    
+        return frame
 
     def guardar_frame(self, frame, frame_index=0):
         """
@@ -461,3 +527,30 @@ class KSoccer:
                 print(f'Error al guardar la imagen del frame {frame_index}.')
         except Exception as e:
             print(f"Error al guardar el frame {frame_index}: {str(e)}")
+
+    def draw_arrow_head(self, frame, start_point, end_point, color, size):
+        """
+        Helper function to draw arrow head
+        """
+        # Calculate arrow direction
+        dx = end_point[0] - start_point[0]
+        dy = end_point[1] - start_point[1]
+        angle = np.arctan2(dy, dx)
+        
+        # Calculate arrow head points
+        angle_left = angle + np.pi/6
+        angle_right = angle - np.pi/6
+        
+        pt_left = (
+            int(end_point[0] - size * np.cos(angle_left)),
+            int(end_point[1] - size * np.sin(angle_left))
+        )
+        
+        pt_right = (
+            int(end_point[0] - size * np.cos(angle_right)),
+            int(end_point[1] - size * np.sin(angle_right))
+        )
+        
+        # Draw arrow head lines
+        cv2.line(frame, end_point, pt_left, color, 2)
+        cv2.line(frame, end_point, pt_right, color, 2)
