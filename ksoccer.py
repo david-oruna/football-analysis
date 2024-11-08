@@ -87,7 +87,6 @@ class KSoccer:
                 start_time = time.time()
 
                 frame = self.process_frame(frame)
-                self.draw_possession_stats(frame)
                 if self.save == True:
                     self.guardar_frame(frame,frames_leidos)
 
@@ -121,14 +120,11 @@ class KSoccer:
 
 
     def process_frame(self, frame):
-        original_height, original_width = frame.shape[:2]
-        frame = cv2.resize(frame, (int(original_width * self.scale_factor), int(original_height * self.scale_factor)))
-        
+
         # Process person detections
         results = self.yolo_model(frame, classes=[0], conf=0.25)
         
-        # Process ball detections with lower confidence
-        ball_results = self.model_pelota(frame, classes=[32], conf=0.05)
+        ball_results = self.model_pelota(frame, classes=[32])
         
         # Get ball bbox if detected
         ball_bbox = np.array([0, 0, 0, 0])
@@ -136,9 +132,8 @@ class KSoccer:
             ball_box = ball_results[0].boxes[0]
             if len(ball_box.xyxy) > 0:
                 ball_bbox = ball_box.xyxy[0].cpu().numpy()
-                if self.depurar:
-                    x1, y1, x2, y2 = ball_bbox.astype(int)
-                    cv2.circle(frame, (int((x1+x2)/2), int((y1+y2)/2)), 5, (0, 255, 255), -1)
+                x1, y1, x2, y2 = ball_bbox.astype(int)
+                cv2.circle(frame, (int((x1+x2)/2), int((y1+y2)/2)), 5, (0, 255, 255), -1)
 
         player_detections = []
         
@@ -160,14 +155,9 @@ class KSoccer:
             frame = self.draw_results(frame, player_detections)
             frame = self.draw_possession_stats(frame)
 
-        if self.depurar:
-            if self.save and self.ruta_carpeta:
-                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                debug_path = os.path.join(self.ruta_carpeta, f'debug_{timestamp}.jpg')
-                cv2.imwrite(debug_path, frame)
             
-            cv2.imshow('Debug View', frame)
-            cv2.waitKey(1)
+        cv2.imshow('Debug View', frame)
+        cv2.waitKey(1)
         
         return frame
 
@@ -209,21 +199,22 @@ class KSoccer:
                 # Draw player bbox in green
                 cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
                 
+
                 # Draw jersey region in blue
-                cv2.rectangle(frame, (jersey_x1, jersey_y1), (jersey_x2, jersey_y2), (255, 0, 0), 2)
+                #cv2.rectangle(frame, (jersey_x1, jersey_y1), (jersey_x2, jersey_y2), (255, 0, 0), 2)
                 
                 # Convert HSV color to BGR for visualization
                 bgr_color = cv2.cvtColor(np.uint8([[jersey_color]]), cv2.COLOR_HSV2BGR)[0][0]
                 
                 # Fill jersey region with mean color (semi-transparent frame)
                 
-                cv2.rectangle(frame, (jersey_x1, jersey_y1), (jersey_x2, jersey_y2), 
-                             (int(bgr_color[0]), int(bgr_color[1]), int(bgr_color[2])), -1)
+                #cv2.rectangle(frame, (jersey_x1, jersey_y1), (jersey_x2, jersey_y2), 
+                             #(int(bgr_color[0]), int(bgr_color[1]), int(bgr_color[2])), -1)
                 
                 # Add color information text
-                cv2.putText(frame, f"HSV: {jersey_color.astype(int)}", 
-                           (jersey_x1, jersey_y1-5), 
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2)
+                #cv2.putText(frame, f"HSV: {jersey_color.astype(int)}", 
+                           #(jersey_x1, jersey_y1-5), 
+                           #cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2)
 
             # Calculate player center and check ball possession
             player_center = (int((x1 + x2) // 2), int((y1 + y2) // 2))
@@ -370,7 +361,7 @@ class KSoccer:
                     
                     # Only assign to team if distance is within threshold
                     min_dist = min(dist1, dist2)
-                    if min_dist < 75:  # Adjust threshold as needed
+                    if min_dist < 55:  # Adjust threshold as needed
                         player['team'] = 1 if dist1 < dist2 else 2
                     else:
                         player['team'] = None  # Mark as outlier (goalkeeper/referee)
@@ -524,17 +515,19 @@ class KSoccer:
         cv2.addWeighted(frame, 0.7, frame, 0.3, 0, frame)
         
         # Draw text
+        
         cv2.putText(frame, "Possession Statistics", 
                     (20, 35), cv2.FONT_HERSHEY_SIMPLEX, 
                     0.7, (255, 255, 255), 2)
         
+        
         cv2.putText(frame, f"Team 1 (Red): {team1_possession:.1f}%", 
                     (20, 60), cv2.FONT_HERSHEY_SIMPLEX, 
-                    0.6, (255, 255, 255), 2)
+                    0.6, (0,0,255), 2)
         
         cv2.putText(frame, f"Team 2 (Blue): {team2_possession:.1f}%", 
                     (20, 85), cv2.FONT_HERSHEY_SIMPLEX, 
-                    0.6, (255, 255, 255), 2)
+                    0.6, (255,0,0), 2)
 
         # Debug print
         if self.depurar:
