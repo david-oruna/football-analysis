@@ -1,6 +1,6 @@
 # K-Soccer - Football Object Detection Project
 
-The goal of this project is to analyze soccer matches using YOLO and image proccessing. 
+The goal of this project is to analyze soccer matches using YOLO and image proccessing with OpenCV. 
 
 
 
