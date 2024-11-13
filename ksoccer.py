@@ -1,21 +1,19 @@
-import cv2
-import time
-import torch
-import numpy as np
-from ultralytics import YOLO
-from collections import Counter
 import os
-import matplotlib.pyplot as plt
-from sklearn.cluster import KMeans
+
+import cv2
 import numpy as np
-from sklearn.cluster import DBSCAN
-from datetime import datetime
+import torch
+from ultralytics import YOLO
+
+
+
 
 class KSoccer:
     def __init__(self, model='yolov8n.pt', source='camera', path=None, ruta_carpeta=None, save = False, scale_factor = 1,depurar = False):
         # Inicialización de model y dispositivo
         self.yolo_model = YOLO(model)
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        
         print(f"Using device: {self.device}")
         self.model_pelota = YOLO('yolo11x.pt')
         self.yolo_model.to(self.device)
@@ -204,7 +202,7 @@ class KSoccer:
                 #cv2.rectangle(frame, (jersey_x1, jersey_y1), (jersey_x2, jersey_y2), (255, 0, 0), 2)
                 
                 # Convert HSV color to BGR for visualization
-                bgr_color = cv2.cvtColor(np.uint8([[jersey_color]]), cv2.COLOR_HSV2BGR)[0][0]
+                cv2.cvtColor(np.uint8([[jersey_color]]), cv2.COLOR_HSV2BGR)[0][0]
                 
                 # Fill jersey region with mean color (semi-transparent frame)
                 
